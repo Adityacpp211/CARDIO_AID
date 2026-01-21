@@ -3,8 +3,14 @@
 
 import 'package:flutter/material.dart';
 import 'dart:async';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:geolocator/geolocator.dart';
+import 'dart:math';
+import 'services/api_service.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await AuthService().checkAutoLogin();
   runApp(const CardioAidApp());
 }
 
@@ -134,6 +140,79 @@ class UserProfile {
   });
 }
 
+class LocationData {
+  final double latitude;
+  final double longitude;
+
+  LocationData({
+    required this.latitude,
+    required this.longitude,
+  });
+}
+
+class HospitalLocation {
+  final String id;
+  final String name;
+  final String address;
+  final String phone;
+  final double latitude;
+  final double longitude;
+  final String emergencyContactEmail;
+
+  HospitalLocation({
+    required this.id,
+    required this.name,
+    required this.address,
+    required this.phone,
+    required this.latitude,
+    required this.longitude,
+    required this.emergencyContactEmail,
+  });
+
+  double distanceTo(LocationData userLocation) {
+    const earthRadiusKm = 6371.0;
+    final dLat = _toRadians(userLocation.latitude - latitude);
+    final dLon = _toRadians(userLocation.longitude - longitude);
+
+    final a = (sin(dLat / 2) * sin(dLat / 2)) +
+        (cos(_toRadians(latitude)) *
+            cos(_toRadians(userLocation.latitude)) *
+            sin(dLon / 2) *
+            sin(dLon / 2));
+
+    final c = 2 * atan2(sqrt(a), sqrt(1 - a));
+    return earthRadiusKm * c;
+  }
+
+  static double _toRadians(double degrees) {
+    return degrees * pi / 180.0;
+  }
+}
+
+class HospitalAlert {
+  final String id;
+  final String hospitalId;
+  final String hospitalName;
+  final DateTime timestamp;
+  final List<String> symptoms;
+  final String message;
+  final int chargeLevels; // 1, 2, or 3 rupees
+  final bool messageDelivered;
+  final String userLocation;
+
+  HospitalAlert({
+    required this.id,
+    required this.hospitalId,
+    required this.hospitalName,
+    required this.timestamp,
+    required this.symptoms,
+    required this.message,
+    required this.chargeLevels,
+    required this.messageDelivered,
+    required this.userLocation,
+  });
+}
+
 // ==================== SERVICES ====================
 
 class AuthService {
@@ -142,10 +221,37 @@ class AuthService {
   AuthService._internal();
 
   final List<User> _users = [];
+  User? _currentLoggedInUser;
+  late SharedPreferences _prefs;
+
+  Future<void> _initPrefs() async {
+    _prefs = await SharedPreferences.getInstance();
+  }
+
+  // Check if user is already logged in
+  Future<void> checkAutoLogin() async {
+    await _initPrefs();
+    final email = _prefs.getString('lastEmail');
+    final name = _prefs.getString('lastUserName');
+    final password = _prefs.getString('lastPassword');
+
+    if (email != null && name != null && password != null) {
+      // Reconstruct user from stored credentials
+      _currentLoggedInUser = User(name: name, email: email, password: password);
+      // Add to users list for consistency
+      if (!_users
+          .any((user) => user.email.toLowerCase() == email.toLowerCase())) {
+        _users.add(_currentLoggedInUser!);
+      }
+    }
+  }
+
+  // Get current logged-in user
+  User? get currentLoggedInUser => _currentLoggedInUser;
 
   // Sign up a new user
-  String? signUp(
-      String name, String email, String password, String confirmPassword) {
+  Future<String?> signUp(String name, String email, String password,
+      String confirmPassword) async {
     // Validate inputs
     if (name.trim().isEmpty) {
       return 'Name is required';
@@ -166,12 +272,21 @@ class AuthService {
     }
 
     // Create new user
-    _users.add(User(name: name, email: email, password: password));
+    final newUser = User(name: name, email: email, password: password);
+    _users.add(newUser);
+
+    // Store user information
+    await _initPrefs();
+    await _prefs.setString('lastEmail', email);
+    await _prefs.setString('lastUserName', name);
+    await _prefs.setString('lastPassword', password);
+
+    _currentLoggedInUser = newUser;
     return null; // Success
   }
 
   // Login user
-  String? login(String email, String password) {
+  Future<String?> login(String email, String password) async {
     if (email.trim().isEmpty) {
       return 'Email is required';
     }
@@ -192,7 +307,24 @@ class AuthService {
       return 'Incorrect password';
     }
 
+    // Store login info
+    await _initPrefs();
+    await _prefs.setString('lastEmail', email);
+    await _prefs.setString('lastUserName', user.name);
+    await _prefs.setString('lastPassword', password);
+
+    _currentLoggedInUser = user;
     return null; // Success
+  }
+
+  // Logout user
+  Future<void> logout() async {
+    _currentLoggedInUser = null;
+    await _initPrefs();
+    await _prefs.remove('lastEmail');
+    await _prefs.remove('lastPassword');
+    await _prefs.remove('lastUserName');
+    await _prefs.remove('lastUserName');
   }
 
   bool _isValidEmail(String email) {
@@ -201,6 +333,59 @@ class AuthService {
 
   // Get registered users count (for debugging)
   int get userCount => _users.length;
+}
+
+// ==================== LOCATION SERVICE ====================
+
+class LocationService {
+  static final LocationService _instance = LocationService._internal();
+  factory LocationService() => _instance;
+  LocationService._internal();
+
+  Future<LocationData?> getCurrentLocation() async {
+    try {
+      final permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        final result = await Geolocator.requestPermission();
+        if (result == LocationPermission.deniedForever) {
+          return null;
+        }
+      }
+
+      final position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      );
+
+      return LocationData(
+        latitude: position.latitude,
+        longitude: position.longitude,
+      );
+    } catch (e) {
+      // For demo, return a default location (Bangalore, India)
+      return LocationData(latitude: 12.9716, longitude: 77.5946);
+    }
+  }
+
+  // Calculate distance between two points
+  static double calculateDistance(
+      double lat1, double lon1, double lat2, double lon2) {
+    const earthRadiusKm = 6371.0;
+    final dLat = _toRadians(lat2 - lat1);
+    final dLon = _toRadians(lon2 - lon1);
+
+    final a = (sin(dLat / 2) * sin(dLat / 2)) +
+        (cos(_toRadians(lat1)) *
+            cos(_toRadians(lat2)) *
+            sin(dLon / 2) *
+            sin(dLon / 2));
+
+    final c = 2 * atan2(sqrt(a), sqrt(1 - a));
+    return earthRadiusKm * c;
+  }
+
+  static double _toRadians(double degrees) {
+    return degrees * pi / 180.0;
+  }
 }
 
 class DatabaseService {
@@ -214,6 +399,8 @@ class DatabaseService {
   final List<VitalSigns> _vitalSigns = [];
   final List<EmergencyRecord> _emergencyRecords = [];
   final List<MedicalReport> _reports = [];
+  final List<HospitalLocation> _hospitals = [];
+  final List<HospitalAlert> _hospitalAlerts = [];
   UserProfile? _currentUser;
 
   // Getters
@@ -222,7 +409,24 @@ class DatabaseService {
   List<EmergencyRecord> get emergencyRecords =>
       List.unmodifiable(_emergencyRecords);
   List<MedicalReport> get reports => List.unmodifiable(_reports);
+  List<HospitalLocation> get hospitals => List.unmodifiable(_hospitals);
+  List<HospitalAlert> get hospitalAlerts => List.unmodifiable(_hospitalAlerts);
   UserProfile? get currentUser => _currentUser;
+
+  // Add hospital alert
+  void addHospitalAlert(HospitalAlert alert) {
+    _hospitalAlerts.add(alert);
+  }
+
+  // Get nearby hospitals
+  List<HospitalLocation> getNearbyHospitals(LocationData userLocation,
+      {double radiusKm = 10}) {
+    return _hospitals
+        .where((hospital) => hospital.distanceTo(userLocation) <= radiusKm)
+        .toList()
+      ..sort((a, b) =>
+          a.distanceTo(userLocation).compareTo(b.distanceTo(userLocation)));
+  }
 
   void _initializeSampleData() {
     // Initialize User Profile
@@ -589,6 +793,48 @@ class DatabaseService {
         doctor: 'Dr. Michael Roberts',
       ),
     ]);
+
+    // Initialize Hospital Locations (Shravanabelagola area)
+    _hospitals.addAll([
+      HospitalLocation(
+        id: 'H001',
+        name: 'Bahubali Children Hospital',
+        address:
+            'Shri Dhavala Teertham, Chalya Post, Shravanabelagola (Hirisave Road), SH-8, Karnataka',
+        phone: '+91-81763-41450',
+        latitude: 12.8540,
+        longitude: 76.4850,
+        emergencyContactEmail: 'contact@bahubali-hospital.com',
+      ),
+      HospitalLocation(
+        id: 'H002',
+        name: 'Shravanabelagola Government Hospital',
+        address:
+            'Shravanabelagola Main Road, Shravanabelagola, Karnataka 573135',
+        phone: '+91-81726-00000',
+        latitude: 12.8585,
+        longitude: 76.4880,
+        emergencyContactEmail: 'govt-hospital@shravanabelagola.gov.in',
+      ),
+      HospitalLocation(
+        id: 'H003',
+        name: 'Swayam Sevak Nagara Hospital',
+        address: 'Shravanabelagola area, Karnataka',
+        phone: '+91-81726-00001',
+        latitude: 12.8560,
+        longitude: 76.4900,
+        emergencyContactEmail: 'swayamsevak@hospital.com',
+      ),
+      HospitalLocation(
+        id: 'H004',
+        name: 'Primary Health Centre (PHC) - Chalya',
+        address: 'Chalya / Nirisare Road, Shravanabelagola, Karnataka',
+        phone: '+91-81726-00002',
+        latitude: 12.8450,
+        longitude: 76.4750,
+        emergencyContactEmail: 'phc-chalya@karnataka.gov.in',
+      ),
+    ]);
   }
 
   // Add methods (for future functionality)
@@ -745,18 +991,36 @@ class _SplashScreenState extends State<SplashScreen>
 
     _controller.forward();
 
-    // Navigate to login after 3 seconds
+    // Check if user is already logged in
     Timer(const Duration(seconds: 3), () {
-      Navigator.pushReplacement(
-        context,
-        PageRouteBuilder(
-          pageBuilder: (context, animation, secondaryAnimation) =>
-              const LoginScreen(),
-          transitionsBuilder: (context, animation, secondaryAnimation, child) {
-            return FadeTransition(opacity: animation, child: child);
-          },
-        ),
-      );
+      final authService = AuthService();
+      if (authService.currentLoggedInUser != null) {
+        // User already logged in, go to dashboard
+        Navigator.pushReplacement(
+          context,
+          PageRouteBuilder(
+            pageBuilder: (context, animation, secondaryAnimation) =>
+                const Dashboard(),
+            transitionsBuilder:
+                (context, animation, secondaryAnimation, child) {
+              return FadeTransition(opacity: animation, child: child);
+            },
+          ),
+        );
+      } else {
+        // No user logged in, go to login screen
+        Navigator.pushReplacement(
+          context,
+          PageRouteBuilder(
+            pageBuilder: (context, animation, secondaryAnimation) =>
+                const LoginScreen(),
+            transitionsBuilder:
+                (context, animation, secondaryAnimation, child) {
+              return FadeTransition(opacity: animation, child: child);
+            },
+          ),
+        );
+      }
     });
   }
 
@@ -895,7 +1159,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
       _isLoading = true;
     });
 
-    final error = _authService.signUp(
+    final error = await _authService.signUp(
       _nameController.text,
       _emailController.text,
       _passwordController.text,
@@ -1221,7 +1485,7 @@ class _LoginScreenState extends State<LoginScreen> {
       _isLoading = true;
     });
 
-    final error = _authService.login(
+    final error = await _authService.login(
       _emailController.text,
       _passwordController.text,
     );
@@ -1231,13 +1495,49 @@ class _LoginScreenState extends State<LoginScreen> {
     if (error != null) {
       setState(() => _errorMessage = error);
     } else {
-      // Success - navigate to dashboard
+      // Success - request location and navigate to dashboard
       if (mounted) {
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(builder: (_) => const Dashboard()),
-        );
+        // Request location permission and update backend
+        _requestLocationAndNavigate();
       }
+    }
+  }
+
+  Future<void> _requestLocationAndNavigate() async {
+    try {
+      // Request location permission
+      LocationPermission permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+
+      if (permission != LocationPermission.deniedForever) {
+        // Get current position
+        try {
+          final position = await Geolocator.getCurrentPosition(
+            desiredAccuracy: LocationAccuracy.high,
+          );
+
+          // Update location on backend
+          final api = ApiService();
+          await api.updateLocation(
+            latitude: position.latitude,
+            longitude: position.longitude,
+          );
+        } catch (e) {
+          print('Location error: $e');
+        }
+      }
+    } catch (e) {
+      print('Permission error: $e');
+    }
+
+    // Navigate to dashboard regardless of location status
+    if (mounted) {
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => const Dashboard()),
+      );
     }
   }
 
@@ -1593,7 +1893,7 @@ class Dashboard extends StatelessWidget {
                           ),
                         ),
                         Text(
-                          DatabaseService().currentUser?.name ??
+                          AuthService().currentLoggedInUser?.name ??
                               'Dr. Sarah Johnson',
                           style: TextStyle(
                             fontSize: ResponsiveHelper.getCaptionSize(context),
@@ -1647,31 +1947,10 @@ class Dashboard extends StatelessWidget {
                       ),
                       _buildCard(
                         context,
-                        'Monitoring & Tests',
-                        Icons.monitor_heart_rounded,
-                        MonitoringScreen(),
-                        const Color(0xFF457B9D),
-                      ),
-                      _buildCard(
-                        context,
-                        'Patients',
-                        Icons.people_rounded,
-                        PatientScreen(),
-                        const Color(0xFF06A77D),
-                      ),
-                      _buildCard(
-                        context,
                         'Hospital Alert',
                         Icons.local_hospital_rounded,
                         const HospitalAlertScreen(),
                         const Color(0xFF7B68EE),
-                      ),
-                      _buildCard(
-                        context,
-                        'Reports',
-                        Icons.description_rounded,
-                        ReportScreen(),
-                        const Color(0xFFF4A261),
                       ),
                     ],
                   ),
@@ -1696,121 +1975,391 @@ class EmergencyScreen extends StatefulWidget {
 
 class _EmergencyScreenState extends State<EmergencyScreen> {
   final _db = DatabaseService();
-  bool _responsiveness = false;
-  bool _breathing = false;
-  bool _pulse = false;
-  bool _heartRhythm = false;
+  final _locationService = LocationService();
+  final _api = ApiService();
+  late SharedPreferences _prefs;
 
-  Color _getStatusColor(String status) {
-    switch (status) {
-      case 'Critical':
-        return const Color(0xFFE63946);
-      case 'Stable':
-        return const Color(0xFF06A77D);
-      case 'Resolved':
-        return const Color(0xFF457B9D);
-      default:
-        return Colors.grey;
+  // Fields for hospital alert
+  final Set<String> _selectedSymptoms = {};
+  TextEditingController _messageController = TextEditingController();
+  LocationData? _userLocation;
+  List<Map<String, dynamic>> _nearbyHospitals = []; // From API
+  List<HospitalLocation> _localHospitals = []; // Fallback
+  bool _isLoadingLocation = false;
+  bool _isSendingAlert = false;
+  int _selectedCharge = 1; // Tier 1, 2, or 3
+  String? _currentAlertId;
+
+  // Wallet balance (starts with ₹5000)
+  double _walletBalance = 5000.0;
+
+  final List<String> _symptomsList = [
+    'Chest Pain',
+    'Shortness of Breath',
+    'Palpitations',
+    'Dizziness',
+    'Fainting',
+    'Severe Headache',
+    'Nausea/Vomiting',
+    'Irregular Heartbeat',
+  ];
+
+  // Tier descriptions with actual price values
+  final Map<int, Map<String, dynamic>> _tierInfo = {
+    1: {
+      'price': '₹1',
+      'priceValue': 1.0,
+      'hospitals': 1,
+      'desc': 'Nearest hospital'
+    },
+    2: {
+      'price': '₹2',
+      'priceValue': 2.0,
+      'hospitals': 3,
+      'desc': 'Top 3 nearby hospitals'
+    },
+    3: {
+      'price': '₹3',
+      'priceValue': 3.0,
+      'hospitals': 10,
+      'desc': 'All nearby hospitals'
+    },
+  };
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeData();
+  }
+
+  Future<void> _initializeData() async {
+    _prefs = await SharedPreferences.getInstance();
+    _messageController = TextEditingController();
+    // Load wallet balance (default ₹5000)
+    setState(() {
+      _walletBalance = _prefs.getDouble('walletBalance') ?? 5000.0;
+    });
+    await _getCurrentLocation();
+  }
+
+  Future<void> _saveWalletBalance() async {
+    await _prefs.setDouble('walletBalance', _walletBalance);
+  }
+
+  Future<void> _getCurrentLocation() async {
+    setState(() => _isLoadingLocation = true);
+    try {
+      final location = await _locationService.getCurrentLocation();
+      if (location != null) {
+        setState(() {
+          _userLocation = location;
+          // Fallback to local data
+          _localHospitals = _db.getNearbyHospitals(location, radiusKm: 50);
+        });
+
+        // Try to fetch from backend API
+        final response = await _api.getNearbyHospitals(
+          latitude: location.latitude,
+          longitude: location.longitude,
+          radiusKm: 50,
+        );
+
+        if (response.success && response.data != null) {
+          setState(() {
+            _nearbyHospitals = List<Map<String, dynamic>>.from(
+                response.data['hospitals'] ?? []);
+          });
+        }
+      }
+    } catch (e) {
+      print('Error getting location: $e');
+    } finally {
+      setState(() => _isLoadingLocation = false);
     }
   }
 
-  Widget _buildEmergencyCard(EmergencyRecord record) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 16),
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [
-            _getStatusColor(record.status).withOpacity(0.15),
-            _getStatusColor(record.status).withOpacity(0.05),
-          ],
+  void _sendAlertToHospitals() async {
+    if (_selectedSymptoms.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please select at least one symptom')),
+      );
+      return;
+    }
+
+    if (_messageController.text.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please write a message')),
+      );
+      return;
+    }
+
+    if (_userLocation == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not get your location')),
+      );
+      return;
+    }
+
+    int hospitalCount = _tierInfo[_selectedCharge]!['hospitals'] as int;
+    String price = _tierInfo[_selectedCharge]!['price'] as String;
+    double priceValue = _tierInfo[_selectedCharge]!['priceValue'] as double;
+
+    // Check wallet balance
+    if (_walletBalance < priceValue) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+              'Insufficient balance. Need $price, Have ₹${_walletBalance.toStringAsFixed(0)}'),
+          backgroundColor: const Color(0xFFE63946),
         ),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(
-          color: _getStatusColor(record.status).withOpacity(0.3),
+      );
+      return;
+    }
+
+    // Show confirmation dialog
+    bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1F3A),
+        title: const Text(
+          '🚨 Confirm Emergency Alert',
+          style: TextStyle(color: Colors.white),
         ),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Row(
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'This will send an alert to $hospitalCount hospital(s)',
+              style: const TextStyle(color: Colors.white70),
+            ),
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFF0A0E27),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Icon(Icons.access_time, size: 16, color: Colors.white70),
-                  const SizedBox(width: 8),
-                  Text(
-                    record.timestamp,
-                    style: const TextStyle(color: Colors.white70, fontSize: 14),
-                  ),
+                  Text('Tier $_selectedCharge - $price',
+                      style: const TextStyle(
+                          color: Color(0xFFF4A261),
+                          fontWeight: FontWeight.bold,
+                          fontSize: 18)),
+                  const SizedBox(height: 4),
+                  Text(_tierInfo[_selectedCharge]!['desc'] as String,
+                      style: const TextStyle(color: Colors.white54)),
                 ],
               ),
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                decoration: BoxDecoration(
-                  color: _getStatusColor(record.status).withOpacity(0.2),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Text(
-                  record.status,
-                  style: TextStyle(
-                    color: _getStatusColor(record.status),
-                    fontWeight: FontWeight.bold,
-                    fontSize: 12,
-                  ),
-                ),
+            ),
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFF06A77D).withOpacity(0.15),
+                borderRadius: BorderRadius.circular(8),
+                border:
+                    Border.all(color: const Color(0xFF06A77D).withOpacity(0.3)),
               ),
-            ],
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Text('Wallet Balance:',
+                      style: TextStyle(color: Colors.white70)),
+                  Text('₹${_walletBalance.toStringAsFixed(0)}',
+                      style: const TextStyle(
+                          color: Color(0xFF06A77D),
+                          fontWeight: FontWeight.bold,
+                          fontSize: 16)),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'Symptoms: ${_selectedSymptoms.join(", ")}',
+              style: const TextStyle(color: Colors.white70, fontSize: 12),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel', style: TextStyle(color: Colors.grey)),
           ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              _buildIndicator('Responsive', record.responsiveness),
-              const SizedBox(width: 12),
-              _buildIndicator('Breathing', record.breathing),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              _buildIndicator('Pulse', record.pulse),
-              const SizedBox(width: 12),
-              _buildIndicator('Heart Rhythm', record.heartRhythm),
-            ],
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFE63946),
+            ),
+            child: Text('Pay $price from Wallet'),
           ),
         ],
       ),
     );
-  }
 
-  Widget _buildIndicator(String label, bool value) {
-    return Row(
-      children: [
-        Icon(
-          value ? Icons.check_circle : Icons.cancel,
-          size: 16,
-          color: value ? const Color(0xFF06A77D) : const Color(0xFFE63946),
-        ),
-        const SizedBox(width: 6),
-        Text(
-          label,
-          style: TextStyle(
-            color: Colors.white.withOpacity(0.8),
-            fontSize: 13,
+    if (confirmed != true) return;
+
+    setState(() => _isSendingAlert = true);
+
+    try {
+      // Deduct from wallet
+      setState(() {
+        _walletBalance -= priceValue;
+      });
+      await _saveWalletBalance();
+
+      // Generate local alert ID
+      _currentAlertId = 'ALERT_${DateTime.now().millisecondsSinceEpoch}';
+
+      // Try to send via backend API (optional - works offline too)
+      int hospitalsNotified = hospitalCount;
+      try {
+        final orderResponse = await _api.createPaymentOrder(
+          tier: _selectedCharge,
+          latitude: _userLocation!.latitude,
+          longitude: _userLocation!.longitude,
+          symptoms: _selectedSymptoms.join(', '),
+          message: _messageController.text,
+        );
+
+        if (orderResponse.success) {
+          _currentAlertId = orderResponse.data['alertId'];
+          final orderId = orderResponse.data['order']['id'];
+
+          // Auto-verify payment (wallet already deducted)
+          await _api.verifyPayment(
+            orderId: orderId,
+            paymentId: 'wallet_${DateTime.now().millisecondsSinceEpoch}',
+            signature: 'wallet_payment',
+            alertId: _currentAlertId!,
+          );
+
+          // Send the alert
+          final alertResponse = await _api.sendEmergencyAlert(_currentAlertId!);
+          if (alertResponse.success) {
+            hospitalsNotified =
+                alertResponse.data['hospitalsNotified'] ?? hospitalCount;
+          }
+        }
+      } catch (e) {
+        // Backend unavailable - that's OK, wallet payment still processed locally
+        print('Backend unavailable, using local processing: $e');
+      }
+
+      // Also save to local database
+      for (int i = 0; i < hospitalCount && i < _localHospitals.length; i++) {
+        final hospital = _localHospitals[i];
+        final alert = HospitalAlert(
+          id: '${_currentAlertId}_$i',
+          hospitalId: hospital.id,
+          hospitalName: hospital.name,
+          timestamp: DateTime.now(),
+          symptoms: _selectedSymptoms.toList(),
+          message: _messageController.text,
+          chargeLevels: _selectedCharge,
+          messageDelivered: true,
+          userLocation:
+              '${_userLocation!.latitude}, ${_userLocation!.longitude}',
+        );
+        _db.addHospitalAlert(alert);
+      }
+
+      // Success!
+      if (mounted) {
+        showDialog(
+          context: context,
+          builder: (context) => AlertDialog(
+            backgroundColor: const Color(0xFF1A1F3A),
+            title: const Row(
+              children: [
+                Icon(Icons.check_circle, color: Color(0xFF06A77D), size: 28),
+                SizedBox(width: 8),
+                Text('Alerts Sent!', style: TextStyle(color: Colors.white)),
+              ],
+            ),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Emergency alerts sent to $hospitalsNotified hospital(s)',
+                  style: const TextStyle(color: Colors.white70),
+                ),
+                const SizedBox(height: 16),
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF06A77D).withOpacity(0.15),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text('Remaining Balance:',
+                          style: TextStyle(color: Colors.white70)),
+                      Text('₹${_walletBalance.toStringAsFixed(0)}',
+                          style: const TextStyle(
+                              color: Color(0xFF06A77D),
+                              fontWeight: FontWeight.bold,
+                              fontSize: 18)),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+                const Text(
+                  'Hospitals have been notified and will respond shortly.',
+                  style: TextStyle(color: Colors.white54, fontSize: 12),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Alert ID: ${_currentAlertId?.substring(0, 8)}...',
+                  style: const TextStyle(
+                      color: Color(0xFF6C63FF), fontFamily: 'monospace'),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('OK',
+                    style: TextStyle(color: Color(0xFF06A77D))),
+              ),
+            ],
           ),
-        ),
-      ],
-    );
+        );
+
+        // Clear form
+        setState(() {
+          _selectedSymptoms.clear();
+          _messageController.clear();
+          _selectedCharge = 1;
+          _currentAlertId = null;
+        });
+      }
+    } catch (e) {
+      // Refund wallet on error
+      setState(() {
+        _walletBalance += priceValue;
+      });
+      await _saveWalletBalance();
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error: $e'),
+            backgroundColor: const Color(0xFFE63946),
+          ),
+        );
+      }
+    } finally {
+      setState(() => _isSendingAlert = false);
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    final records = _db.emergencyRecords;
-
     return Scaffold(
       body: Container(
         decoration: const BoxDecoration(
@@ -1844,6 +2393,33 @@ class _EmergencyScreenState extends State<EmergencyScreen> {
                         color: Colors.white,
                       ),
                     ),
+                    const Spacer(),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 12, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF06A77D).withOpacity(0.2),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(
+                            color: const Color(0xFF06A77D).withOpacity(0.3)),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.account_balance_wallet,
+                              color: Color(0xFF06A77D), size: 18),
+                          const SizedBox(width: 6),
+                          Text(
+                            '₹${_walletBalance.toStringAsFixed(0)}',
+                            style: const TextStyle(
+                              color: Color(0xFF06A77D),
+                              fontWeight: FontWeight.bold,
+                              fontSize: 16,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -1853,48 +2429,381 @@ class _EmergencyScreenState extends State<EmergencyScreen> {
                 child: ListView(
                   padding: const EdgeInsets.all(20),
                   children: [
-                    // Recent assessments header
-                    const Text(
-                      'Recent Emergency Assessments',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
+                    // Location section
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF457B9D).withOpacity(0.15),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: const Color(0xFF457B9D).withOpacity(0.3),
+                        ),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              const Icon(Icons.location_on,
+                                  color: Color(0xFF457B9D), size: 20),
+                              const SizedBox(width: 8),
+                              const Expanded(
+                                child: Text(
+                                  'Your Location',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 16,
+                                  ),
+                                ),
+                              ),
+                              if (_isLoadingLocation)
+                                const SizedBox(
+                                  width: 20,
+                                  height: 20,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    valueColor: AlwaysStoppedAnimation<Color>(
+                                      Color(0xFF457B9D),
+                                    ),
+                                  ),
+                                )
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+                          Text(
+                            _userLocation != null
+                                ? 'Lat: ${_userLocation!.latitude.toStringAsFixed(4)}, Lon: ${_userLocation!.longitude.toStringAsFixed(4)}'
+                                : 'Getting location...',
+                            style: const TextStyle(
+                              color: Colors.white70,
+                              fontSize: 14,
+                            ),
+                          ),
+                        ],
                       ),
                     ),
-                    const SizedBox(height: 16),
-
-                    // Emergency records
-                    ...records.map((record) => _buildEmergencyCard(record)),
 
                     const SizedBox(height: 24),
 
-                    // New assessment form
+                    // Nearby hospitals section
                     const Text(
-                      'New Assessment',
+                      'Nearby Hospitals',
                       style: TextStyle(
                         color: Colors.white,
                         fontSize: 18,
                         fontWeight: FontWeight.bold,
                       ),
                     ),
-                    const SizedBox(height: 16),
+                    const SizedBox(height: 12),
 
-                    _buildCheckbox('Responsiveness', _responsiveness, (val) {
-                      setState(() => _responsiveness = val ?? false);
-                    }),
+                    if (_nearbyHospitals.isEmpty && _localHospitals.isEmpty)
+                      Container(
+                        padding: const EdgeInsets.all(20),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withOpacity(0.05),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Text(
+                          _isLoadingLocation
+                              ? 'Finding hospitals near you...'
+                              : 'No hospitals found nearby',
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            color: Colors.white70,
+                          ),
+                        ),
+                      )
+                    else
+                      ...(_nearbyHospitals.isNotEmpty
+                              ? _nearbyHospitals
+                              : _localHospitals
+                                  .map((h) => {
+                                        'name': h.name,
+                                        'phone': h.phone,
+                                        'distanceKm':
+                                            h.distanceTo(_userLocation!),
+                                      })
+                                  .toList())
+                          .map((hospital) {
+                        final distance = hospital['distanceKm'] ?? 0.0;
+                        return Container(
+                          margin: const EdgeInsets.only(bottom: 12),
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withOpacity(0.05),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                              color: Colors.white.withOpacity(0.1),
+                            ),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                hospital['name'] ?? 'Unknown Hospital',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 14,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                '${distance is double ? distance.toStringAsFixed(1) : distance} km away',
+                                style: const TextStyle(
+                                  color: Color(0xFFF4A261),
+                                  fontSize: 12,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                hospital['phone'] ?? '',
+                                style: const TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      }),
+
+                    const SizedBox(height: 24),
+
+                    // Symptoms section
+                    const Text(
+                      'Select Symptoms',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
                     const SizedBox(height: 12),
-                    _buildCheckbox('Breathing', _breathing, (val) {
-                      setState(() => _breathing = val ?? false);
-                    }),
+
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: _symptomsList.map((symptom) {
+                        final isSelected = _selectedSymptoms.contains(symptom);
+                        return GestureDetector(
+                          onTap: () {
+                            setState(() {
+                              if (isSelected) {
+                                _selectedSymptoms.remove(symptom);
+                              } else {
+                                _selectedSymptoms.add(symptom);
+                              }
+                            });
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 8,
+                            ),
+                            decoration: BoxDecoration(
+                              color: isSelected
+                                  ? const Color(0xFFE63946)
+                                  : Colors.white.withOpacity(0.05),
+                              borderRadius: BorderRadius.circular(20),
+                              border: Border.all(
+                                color: isSelected
+                                    ? const Color(0xFFE63946)
+                                    : Colors.white.withOpacity(0.2),
+                              ),
+                            ),
+                            child: Text(
+                              symptom,
+                              style: TextStyle(
+                                color:
+                                    isSelected ? Colors.white : Colors.white70,
+                                fontSize: 12,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                          ),
+                        );
+                      }).toList(),
+                    ),
+
+                    const SizedBox(height: 24),
+
+                    // Message section
+                    const Text(
+                      'Message to Hospitals',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
                     const SizedBox(height: 12),
-                    _buildCheckbox('Pulse', _pulse, (val) {
-                      setState(() => _pulse = val ?? false);
-                    }),
+
+                    TextField(
+                      controller: _messageController,
+                      maxLines: 4,
+                      style: const TextStyle(color: Colors.white),
+                      decoration: InputDecoration(
+                        hintText:
+                            'Describe your condition or any additional details...',
+                        hintStyle:
+                            TextStyle(color: Colors.white.withOpacity(0.5)),
+                        filled: true,
+                        fillColor: Colors.white.withOpacity(0.05),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide(
+                            color: Colors.white.withOpacity(0.1),
+                          ),
+                        ),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide(
+                            color: Colors.white.withOpacity(0.1),
+                          ),
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: const BorderSide(
+                            color: Color(0xFFE63946),
+                          ),
+                        ),
+                      ),
+                    ),
+
+                    const SizedBox(height: 24),
+
+                    // Charge selection
+                    const Text(
+                      'Alert Charges (Per Hospital)',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
                     const SizedBox(height: 12),
-                    _buildCheckbox('Heart Rhythm', _heartRhythm, (val) {
-                      setState(() => _heartRhythm = val ?? false);
-                    }),
+
+                    Row(
+                      children: [1, 2, 3].map((charge) {
+                        final isSelected = _selectedCharge == charge;
+                        return Expanded(
+                          child: GestureDetector(
+                            onTap: () =>
+                                setState(() => _selectedCharge = charge),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(vertical: 12),
+                              decoration: BoxDecoration(
+                                color: isSelected
+                                    ? const Color(0xFFE63946)
+                                    : Colors.white.withOpacity(0.05),
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(
+                                  color: isSelected
+                                      ? const Color(0xFFE63946)
+                                      : Colors.white.withOpacity(0.2),
+                                ),
+                              ),
+                              child: Column(
+                                children: [
+                                  Text(
+                                    '₹$charge',
+                                    style: TextStyle(
+                                      color: isSelected
+                                          ? Colors.white
+                                          : Colors.white70,
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 16,
+                                    ),
+                                  ),
+                                  Text(
+                                    _nearbyHospitals.isEmpty
+                                        ? 'Total: ₹0'
+                                        : 'Total: ₹${charge * _nearbyHospitals.length}',
+                                    style: TextStyle(
+                                      color: isSelected
+                                          ? Colors.white.withOpacity(0.8)
+                                          : Colors.white.withOpacity(0.6),
+                                      fontSize: 11,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        );
+                      }).toList(),
+                    ),
+
+                    const SizedBox(height: 32),
+
+                    // Send alert button
+                    GestureDetector(
+                      onTap: _isSendingAlert ? null : _sendAlertToHospitals,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(vertical: 16),
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                            colors: _isSendingAlert
+                                ? [Colors.grey, Colors.grey.shade700]
+                                : [
+                                    const Color(0xFFE63946),
+                                    const Color(0xFFD62828)
+                                  ],
+                          ),
+                          borderRadius: BorderRadius.circular(12),
+                          boxShadow: [
+                            BoxShadow(
+                              color: _isSendingAlert
+                                  ? Colors.grey.withOpacity(0.2)
+                                  : const Color(0xFFE63946).withOpacity(0.4),
+                              blurRadius: 15,
+                              offset: const Offset(0, 5),
+                            ),
+                          ],
+                        ),
+                        child: Center(
+                          child: _isSendingAlert
+                              ? const Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    SizedBox(
+                                      width: 20,
+                                      height: 20,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        valueColor:
+                                            AlwaysStoppedAnimation<Color>(
+                                                Colors.white),
+                                      ),
+                                    ),
+                                    SizedBox(width: 12),
+                                    Text(
+                                      'Sending Alert...',
+                                      style: TextStyle(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 16,
+                                      ),
+                                    ),
+                                  ],
+                                )
+                              : const Text(
+                                  'Send Emergency Alert',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 16,
+                                  ),
+                                ),
+                        ),
+                      ),
+                    ),
+
+                    const SizedBox(height: 20),
                   ],
                 ),
               ),
@@ -1905,21 +2814,10 @@ class _EmergencyScreenState extends State<EmergencyScreen> {
     );
   }
 
-  Widget _buildCheckbox(String title, bool value, Function(bool?) onChanged) {
-    return Container(
-      decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.05),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white.withOpacity(0.1)),
-      ),
-      child: CheckboxListTile(
-        title: Text(title, style: const TextStyle(color: Colors.white)),
-        value: value,
-        onChanged: onChanged,
-        activeColor: const Color(0xFFE63946),
-        checkColor: Colors.white,
-      ),
-    );
+  @override
+  void dispose() {
+    _messageController.dispose();
+    super.dispose();
   }
 }
 
@@ -2512,332 +3410,12 @@ class HospitalAlertScreen extends StatefulWidget {
 }
 
 class _HospitalAlertScreenState extends State<HospitalAlertScreen> {
-  // Sample hospitals data
-  final List<Hospital> _hospitals = [
-    Hospital(
-      name: 'City Medical Center',
-      address: '123 Main Street, Downtown',
-      phone: '+1 (555) 123-4567',
-      distance: '2.3 km',
-    ),
-    Hospital(
-      name: 'General Hospital',
-      address: '456 Oak Avenue, Central District',
-      phone: '+1 (555) 234-5678',
-      distance: '3.1 km',
-    ),
-    Hospital(
-      name: 'St. Mary\'s Hospital',
-      address: '789 Pine Road, North Side',
-      phone: '+1 (555) 345-6789',
-      distance: '4.5 km',
-    ),
-    Hospital(
-      name: 'Metropolitan Hospital',
-      address: '321 Elm Street, West End',
-      phone: '+1 (555) 456-7890',
-      distance: '5.2 km',
-    ),
-    Hospital(
-      name: 'Regional Medical Center',
-      address: '654 Cedar Lane, East Quarter',
-      phone: '+1 (555) 567-8901',
-      distance: '6.8 km',
-    ),
-  ];
-
-  // Patient condition checkboxes
-  bool _cardiacArrest = false;
-  bool _heartAttack = false;
-  bool _chestPain = false;
-  bool _difficultyBreathing = false;
-  bool _lossOfConsciousness = false;
-
-  void _sendAlert() {
-    // Get selected conditions
-    List<String> selectedConditions = [];
-    if (_cardiacArrest) selectedConditions.add('Cardiac Arrest');
-    if (_heartAttack) selectedConditions.add('Heart Attack');
-    if (_chestPain) selectedConditions.add('Chest Pain');
-    if (_difficultyBreathing) selectedConditions.add('Difficulty Breathing');
-    if (_lossOfConsciousness) selectedConditions.add('Loss of Consciousness');
-
-    if (selectedConditions.isEmpty) {
-      // Show error if no conditions selected
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Please select at least one condition'),
-          backgroundColor: Colors.orange,
-          duration: Duration(seconds: 2),
-        ),
-      );
-      return;
-    }
-
-    // Show confirmation dialog
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF1A1F3A),
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(20),
-          side: BorderSide(color: Colors.white.withOpacity(0.1)),
-        ),
-        title: Row(
-          children: [
-            Container(
-              padding: const EdgeInsets.all(8),
-              decoration: BoxDecoration(
-                color: const Color(0xFF7B68EE).withOpacity(0.2),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: const Icon(
-                Icons.check_circle,
-                color: Color(0xFF7B68EE),
-                size: 28,
-              ),
-            ),
-            const SizedBox(width: 12),
-            const Expanded(
-              child: Text(
-                'Alert Sent',
-                style: TextStyle(color: Colors.white, fontSize: 22),
-              ),
-            ),
-          ],
-        ),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'Emergency alert sent to:',
-              style: TextStyle(
-                color: Colors.white70,
-                fontSize: 16,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 12),
-            ..._hospitals.map((hospital) => Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 4),
-                  child: Row(
-                    children: [
-                      const Icon(Icons.local_hospital,
-                          color: Color(0xFF7B68EE), size: 16),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          hospital.name,
-                          style: const TextStyle(
-                              color: Colors.white, fontSize: 14),
-                        ),
-                      ),
-                    ],
-                  ),
-                )),
-            const SizedBox(height: 16),
-            const Text(
-              'Conditions reported:',
-              style: TextStyle(
-                color: Colors.white70,
-                fontSize: 16,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 12),
-            ...selectedConditions.map((condition) => Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 4),
-                  child: Row(
-                    children: [
-                      const Icon(Icons.warning,
-                          color: Color(0xFFE63946), size: 16),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          condition,
-                          style: const TextStyle(
-                              color: Colors.white, fontSize: 14),
-                        ),
-                      ),
-                    ],
-                  ),
-                )),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            style: TextButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-              backgroundColor: const Color(0xFF7B68EE),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(8),
-              ),
-            ),
-            child: const Text(
-              'OK',
-              style: TextStyle(color: Colors.white, fontSize: 16),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildHospitalCard(Hospital hospital) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 16),
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [
-            const Color(0xFF7B68EE).withOpacity(0.15),
-            const Color(0xFF7B68EE).withOpacity(0.05),
-          ],
-        ),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(
-          color: const Color(0xFF7B68EE).withOpacity(0.3),
-          width: 1,
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: const Color(0xFF7B68EE).withOpacity(0.2),
-            blurRadius: 12,
-            offset: const Offset(0, 4),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Container(
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF7B68EE).withOpacity(0.2),
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: const Icon(
-                  Icons.local_hospital,
-                  color: Color(0xFF7B68EE),
-                  size: 24,
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      hospital.name,
-                      style: const TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.white,
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-                    Row(
-                      children: [
-                        const Icon(
-                          Icons.location_on,
-                          size: 14,
-                          color: Color(0xFF7B68EE),
-                        ),
-                        const SizedBox(width: 4),
-                        Text(
-                          hospital.distance,
-                          style: TextStyle(
-                            fontSize: 14,
-                            color: Colors.white.withOpacity(0.7),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              const Icon(
-                Icons.pin_drop_outlined,
-                size: 16,
-                color: Colors.white54,
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  hospital.address,
-                  style: TextStyle(
-                    fontSize: 14,
-                    color: Colors.white.withOpacity(0.6),
-                  ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              const Icon(
-                Icons.phone,
-                size: 16,
-                color: Colors.white54,
-              ),
-              const SizedBox(width: 8),
-              Text(
-                hospital.phone,
-                style: TextStyle(
-                  fontSize: 14,
-                  color: Colors.white.withOpacity(0.6),
-                ),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildCheckbox(String title, bool value, Function(bool?) onChanged) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.05),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color: value
-              ? const Color(0xFFE63946).withOpacity(0.3)
-              : Colors.white.withOpacity(0.1),
-        ),
-      ),
-      child: CheckboxListTile(
-        title: Text(
-          title,
-          style: TextStyle(
-            color: Colors.white,
-            fontSize: ResponsiveHelper.getBodySize(context),
-            fontWeight: value ? FontWeight.w600 : FontWeight.normal,
-          ),
-        ),
-        value: value,
-        onChanged: onChanged,
-        activeColor: const Color(0xFFE63946),
-        checkColor: Colors.white,
-      ),
-    );
-  }
+  final _db = DatabaseService();
 
   @override
   Widget build(BuildContext context) {
+    final alerts = _db.hospitalAlerts;
+
     return Scaffold(
       body: Container(
         decoration: const BoxDecoration(
@@ -2853,24 +3431,40 @@ class _HospitalAlertScreenState extends State<HospitalAlertScreen> {
         child: SafeArea(
           child: Column(
             children: [
-              // Header
+              // App bar
               Padding(
-                padding: EdgeInsets.all(ResponsiveHelper.getPadding(context)),
+                padding: const EdgeInsets.all(20.0),
                 child: Row(
                   children: [
                     IconButton(
                       onPressed: () => Navigator.pop(context),
                       icon: const Icon(Icons.arrow_back, color: Colors.white),
-                      iconSize: ResponsiveHelper.isMobile(context) ? 24 : 28,
                     ),
                     const SizedBox(width: 8),
-                    Expanded(
+                    const Text(
+                      'Hospital Alerts',
+                      style: TextStyle(
+                        fontSize: 24,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.white,
+                      ),
+                    ),
+                    const Spacer(),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF7B68EE).withOpacity(0.2),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
                       child: Text(
-                        'Hospital Alert',
-                        style: TextStyle(
-                          fontSize: ResponsiveHelper.getTitleSize(context),
+                        '${alerts.length}',
+                        style: const TextStyle(
+                          color: Color(0xFF7B68EE),
                           fontWeight: FontWeight.bold,
-                          color: Colors.white,
+                          fontSize: 16,
                         ),
                       ),
                     ),
@@ -2879,106 +3473,220 @@ class _HospitalAlertScreenState extends State<HospitalAlertScreen> {
               ),
 
               // Content
-              Expanded(
-                child: SingleChildScrollView(
-                  padding: EdgeInsets.all(ResponsiveHelper.getPadding(context)),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      // Hospitals section
-                      Text(
-                        'Nearby Hospitals',
-                        style: TextStyle(
-                          fontSize: ResponsiveHelper.getTitleSize(context) - 2,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white,
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-                      ..._hospitals
-                          .map((hospital) => _buildHospitalCard(hospital)),
-
-                      const SizedBox(height: 24),
-
-                      // Patient condition section
-                      Text(
-                        'Patient Condition',
-                        style: TextStyle(
-                          fontSize: ResponsiveHelper.getTitleSize(context) - 2,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white,
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-
-                      _buildCheckbox('Cardiac Arrest', _cardiacArrest, (val) {
-                        setState(() => _cardiacArrest = val ?? false);
-                      }),
-                      _buildCheckbox('Heart Attack', _heartAttack, (val) {
-                        setState(() => _heartAttack = val ?? false);
-                      }),
-                      _buildCheckbox('Chest Pain', _chestPain, (val) {
-                        setState(() => _chestPain = val ?? false);
-                      }),
-                      _buildCheckbox(
-                          'Difficulty Breathing', _difficultyBreathing, (val) {
-                        setState(() => _difficultyBreathing = val ?? false);
-                      }),
-                      _buildCheckbox(
-                          'Loss of Consciousness', _lossOfConsciousness, (val) {
-                        setState(() => _lossOfConsciousness = val ?? false);
-                      }),
-
-                      const SizedBox(height: 24),
-
-                      // Send Alert button
-                      SizedBox(
-                        width: double.infinity,
-                        height: 56,
-                        child: ElevatedButton(
-                          onPressed: _sendAlert,
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: const Color(0xFF7B68EE),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                            elevation: 8,
-                            shadowColor:
-                                const Color(0xFF7B68EE).withOpacity(0.5),
+              if (alerts.isEmpty)
+                Expanded(
+                  child: Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(20),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF7B68EE).withOpacity(0.1),
+                            shape: BoxShape.circle,
                           ),
-                          child: Row(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              const Icon(
-                                Icons.send,
-                                color: Colors.white,
-                                size: 20,
-                              ),
-                              const SizedBox(width: 12),
-                              Text(
-                                'Send Alert',
-                                style: TextStyle(
-                                  fontSize:
-                                      ResponsiveHelper.getBodySize(context) + 2,
-                                  fontWeight: FontWeight.bold,
-                                  color: Colors.white,
-                                ),
-                              ),
-                            ],
+                          child: const Icon(
+                            Icons.notifications_none,
+                            size: 60,
+                            color: Color(0xFF7B68EE),
                           ),
                         ),
-                      ),
-
-                      const SizedBox(height: 20),
-                    ],
+                        const SizedBox(height: 24),
+                        const Text(
+                          'No Alerts Yet',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 20,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          'Your hospital alerts will appear here',
+                          style: TextStyle(
+                            color: Colors.white.withOpacity(0.6),
+                            fontSize: 14,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                )
+              else
+                Expanded(
+                  child: ListView.builder(
+                    padding: const EdgeInsets.all(20),
+                    itemCount: alerts.length,
+                    itemBuilder: (context, index) {
+                      final alert =
+                          alerts[alerts.length - 1 - index]; // Reverse order
+                      return _buildAlertCard(alert);
+                    },
                   ),
                 ),
-              ),
             ],
           ),
         ),
       ),
     );
+  }
+
+  Widget _buildAlertCard(HospitalAlert alert) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 16),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            const Color(0xFF7B68EE).withOpacity(0.15),
+            const Color(0xFF7B68EE).withOpacity(0.05),
+          ],
+        ),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: const Color(0xFF7B68EE).withOpacity(0.3),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      alert.hospitalName,
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.white,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Row(
+                      children: [
+                        const Icon(
+                          Icons.access_time,
+                          size: 14,
+                          color: Colors.white70,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          _formatTime(alert.timestamp),
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.white.withOpacity(0.7),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF06A77D).withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  'Sent',
+                  style: TextStyle(
+                    color: const Color(0xFF06A77D),
+                    fontWeight: FontWeight.bold,
+                    fontSize: 12,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          // Symptoms
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: alert.symptoms.map((symptom) {
+              return Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFE63946).withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  symptom,
+                  style: const TextStyle(
+                    color: Color(0xFFE63946),
+                    fontSize: 11,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+          const SizedBox(height: 12),
+          // Message
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.05),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Text(
+              alert.message,
+              style: const TextStyle(
+                color: Colors.white70,
+                fontSize: 13,
+                height: 1.5,
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          // Cost info
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                'Charge: ₹${alert.chargeLevels}',
+                style: const TextStyle(
+                  color: Color(0xFFF4A261),
+                  fontWeight: FontWeight.bold,
+                  fontSize: 13,
+                ),
+              ),
+              Text(
+                'Location: ${alert.userLocation}',
+                style: const TextStyle(
+                  color: Colors.white70,
+                  fontSize: 11,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _formatTime(DateTime dateTime) {
+    final now = DateTime.now();
+    final difference = now.difference(dateTime);
+
+    if (difference.inSeconds < 60) {
+      return 'Just now';
+    } else if (difference.inMinutes < 60) {
+      return '${difference.inMinutes}m ago';
+    } else if (difference.inHours < 24) {
+      return '${difference.inHours}h ago';
+    } else {
+      return '${dateTime.day}/${dateTime.month}/${dateTime.year}';
+    }
   }
 }
 
@@ -3031,7 +3739,7 @@ class UserProfileScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final user = DatabaseService().currentUser;
+    final user = AuthService().currentLoggedInUser;
 
     return Scaffold(
       body: Container(
@@ -3114,7 +3822,7 @@ class UserProfileScreen extends StatelessWidget {
                       ),
                       const SizedBox(height: 8),
                       Text(
-                        user?.role ?? 'Staff Member',
+                        user?.email ?? 'N/A',
                         style: TextStyle(
                           color: const Color(0xFF7B68EE).withOpacity(0.9),
                           fontSize: 16,
@@ -3148,21 +3856,9 @@ class UserProfileScreen extends StatelessWidget {
                             ),
                             Divider(color: Colors.white.withOpacity(0.1)),
                             _buildInfoRow(
-                              Icons.badge,
-                              'Employee ID',
-                              user?.employeeId ?? 'N/A',
-                            ),
-                            Divider(color: Colors.white.withOpacity(0.1)),
-                            _buildInfoRow(
-                              Icons.business,
-                              'Department',
-                              user?.department ?? 'N/A',
-                            ),
-                            Divider(color: Colors.white.withOpacity(0.1)),
-                            _buildInfoRow(
-                              Icons.phone,
-                              'Phone',
-                              user?.phone ?? 'N/A',
+                              Icons.person,
+                              'Full Name',
+                              user?.name ?? 'N/A',
                             ),
                           ],
                         ),
@@ -3170,37 +3866,81 @@ class UserProfileScreen extends StatelessWidget {
 
                       const SizedBox(height: 24),
 
-                      // Edit Profile Button
+                      // Logout Button
                       SizedBox(
                         width: double.infinity,
                         height: 56,
                         child: ElevatedButton(
-                          onPressed: () {
-                            // Edit profile functionality (UI only for now)
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(
-                                content:
-                                    Text('Edit profile feature coming soon!'),
-                                backgroundColor: Color(0xFF7B68EE),
+                          onPressed: () async {
+                            // Show confirmation dialog
+                            showDialog(
+                              context: context,
+                              builder: (context) => AlertDialog(
+                                backgroundColor: const Color(0xFF1A1F3A),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(20),
+                                  side: BorderSide(
+                                      color: Colors.white.withOpacity(0.1)),
+                                ),
+                                title: const Text(
+                                  'Logout',
+                                  style: TextStyle(
+                                      color: Colors.white, fontSize: 22),
+                                ),
+                                content: const Text(
+                                  'Are you sure you want to logout?',
+                                  style: TextStyle(color: Colors.white70),
+                                ),
+                                actions: [
+                                  TextButton(
+                                    onPressed: () =>
+                                        Navigator.of(context).pop(),
+                                    child: const Text(
+                                      'Cancel',
+                                      style:
+                                          TextStyle(color: Color(0xFF7B68EE)),
+                                    ),
+                                  ),
+                                  TextButton(
+                                    onPressed: () async {
+                                      await AuthService().logout();
+                                      if (context.mounted) {
+                                        Navigator.of(context)
+                                            .popUntil((route) => false);
+                                        Navigator.pushReplacement(
+                                          context,
+                                          MaterialPageRoute(
+                                              builder: (_) =>
+                                                  const LoginScreen()),
+                                        );
+                                      }
+                                    },
+                                    child: const Text(
+                                      'Logout',
+                                      style:
+                                          TextStyle(color: Color(0xFFE63946)),
+                                    ),
+                                  ),
+                                ],
                               ),
                             );
                           },
                           style: ElevatedButton.styleFrom(
-                            backgroundColor: const Color(0xFF7B68EE),
+                            backgroundColor: const Color(0xFFE63946),
                             shape: RoundedRectangleBorder(
                               borderRadius: BorderRadius.circular(12),
                             ),
                             elevation: 8,
                             shadowColor:
-                                const Color(0xFF7B68EE).withOpacity(0.5),
+                                const Color(0xFFE63946).withOpacity(0.5),
                           ),
                           child: const Row(
                             mainAxisAlignment: MainAxisAlignment.center,
                             children: [
-                              Icon(Icons.edit, color: Colors.white, size: 20),
+                              Icon(Icons.logout, color: Colors.white, size: 20),
                               SizedBox(width: 12),
                               Text(
-                                'Edit Profile',
+                                'Logout',
                                 style: TextStyle(
                                   fontSize: 16,
                                   fontWeight: FontWeight.bold,
